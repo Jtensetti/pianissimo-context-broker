@@ -5,6 +5,10 @@ import copy
 from threading import RLock
 
 
+class PhraseBoostingUnavailable(RuntimeError):
+    """Boosting failed, but the original decoder was successfully restored."""
+
+
 class NemoASR:
     def __init__(self, model, boost_alpha: float = .5):
         if not 0 <= boost_alpha <= 1:
@@ -40,9 +44,9 @@ class NemoASR:
             try:
                 self.model.change_decoding_strategy(decoding)
             except Exception as exc:
-                self.model.change_decoding_strategy(copy.deepcopy(self._original))
                 self._phrases = None
-                raise RuntimeError("Phrase boosting unavailable for this NeMo/model combination") from exc
+                self.model.change_decoding_strategy(copy.deepcopy(self._original))
+                raise PhraseBoostingUnavailable("Phrase boosting unavailable for this NeMo/model combination") from exc
             self._phrases = phrases_tuple
 
     def transcribe(self, audio_path: str) -> str:

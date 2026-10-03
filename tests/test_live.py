@@ -251,3 +251,27 @@ class AdaptiveTests(unittest.IsolatedAsyncioTestCase):
         release.set()
         self.assertFalse(await task)
         self.assertEqual(s.text, "hej")
+
+    async def test_worker_retries_old_request_after_manual_context_without_reviewer(self):
+        entered, release, retried = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        class RepairOnly:
+            calls = 0
+            async def propose(self, payload):
+                self.calls += 1
+                if self.calls == 1:
+                    entered.set()
+                    await release.wait()
+                else:
+                    self.last_context = payload["manual_context"]
+                    retried.set()
+                return {"patches": [{"start": 0, "end": 3, "source": "hej", "replacement": "Hej", "confidence": .99}]}
+        controller = RepairOnly()
+        broker = AdaptiveBroker(controller=controller)
+        async with LiveSession(broker) as session:
+            segment = session.push("hej")
+            await entered.wait()
+            broker.set_manual_context("Rätt bakgrund")
+            release.set()
+            await asyncio.wait_for(retried.wait(), 2)
+        self.assertEqual(controller.last_context, "Rätt bakgrund")
+        self.assertEqual(segment.text, "Hej")

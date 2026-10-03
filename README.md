@@ -31,9 +31,10 @@ inte utkastet. Manuella ändringar lagras som korrigerad bakgrund, medan den
 ursprungliga initialtexten bevaras separat. LLM-svar på äldre kontext avvisas,
 både för kontextuppdateringar och transkriptpatchar.
 
-**Stoppa** stänger ljudflödet och lämnar transkriptet kvar. En ny **Starta**
-börjar en ny inspelning. Pågående modellladdning eller ASR i en arbetstråd måste
-avslutas innan en ny inspelning kan starta. Statusen är då **Stoppar**.
+**Stoppa** stänger ljudflödet och transkriberar klart redan köat ljud, inklusive
+det sista ofullständiga klippet. Transkriptet ligger kvar. Statusen är
+**Stoppar** tills detta är klart; även pågående modellladdning måste avslutas.
+En ny **Starta** kan därefter börja en ny inspelning.
 
 Appen binder endast till loopback, har `share=False` och Gradio-analys avstängd.
 En aktiv inspelning per app-process. Mikrofonen fångas via PortAudio på samma
@@ -136,8 +137,9 @@ Live-ASR kör **oberoende ljudklipp**, som standard fyra sekunder; ändra med
 `microphone --chunk-seconds 3`. Mikrofonen fortsätter fånga ljud medan ASR och
 LLM arbetar. Ljudkön rymmer tre klipp. Om ASR halkar efter tappas nya klipp med
 ett uttryckligt `audio_drop`-event och tidsintervall. Det finns ingen tyst,
-obegränsad kö som bygger upp fördröjning. Ctrl+C stoppar inspelningen och låser
-redan transkriberad text; köade och ofullständiga klipp transkriberas inte då.
+obegränsad kö som bygger upp fördröjning. I CLI:t avbryter Ctrl+C inspelningen
+och låser redan transkriberad text; köade och ofullständiga klipp transkriberas
+inte då. Appens **Stoppa** behandlar däremot kvarvarande ljud klart.
 
 Detta är chunkad live-ASR, **inte cache-aware neural streaming**. Klippgränser
 kan dela ord; överlappningssammanfogning, diarisation och ordnivå-confidence är
@@ -155,9 +157,11 @@ beror på klipplängd, hårdvara och modeller.
   ändringsbudget. Exempel: `transkriberingsmodulen` → `transkriberingsmodellen`
   när den senare är en aktiv term.
 
-Exakt källtext, rätt offset/revision och olåst segment krävs. Tal inklusive
-tecken i decimaler, kända svenska negationer och vid termsubstitution vissa
-svenska räkneord skyddas. Överlappande batchar avvisas. LLM-confidence måste
+Exakt källtext, rätt offset/revision och olåst segment krävs. Patchar som
+innehåller siffror får bara ändra blanksteg: bland annat minustecken,
+decimaltecken, procenttecken och enheters skiftläge bevaras. Kända svenska
+negationer och vissa svenska räkneord skyddas i alla patchtyper.
+Överlappande batchar avvisas. LLM-confidence måste
 vara minst 0.95, men det är en **heuristik, ingen akustisk sannolikhet**.
 Stränglikhet är inte heller ett bevis för vad som sades: nära ord kan ha olika
 betydelse. Validera automatisk termrättning på egna inspelningar.

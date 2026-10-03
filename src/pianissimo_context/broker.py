@@ -168,10 +168,10 @@ class Broker:
             if not isinstance(proposals, list) or len(proposals) > 32:
                 raise ValueError("Invalid patch list")
             parsed = [Patch(**p) for p in proposals]
-            applied = self.apply(segment_id, revision, parsed)
             candidates = result.get("terms", [])
             if not isinstance(candidates, list) or len(candidates) > 100:
                 raise ValueError("Invalid term list")
+            applied = self.apply(segment_id, revision, parsed)
             # Only literal evidence from RAW can enter dynamic bias. Never use
             # repaired text as evidence: that would reinforce hallucinations.
             evidence = payload["previous_text"] + " " + segment.raw
@@ -207,14 +207,18 @@ class Broker:
                 or not self.threshold <= p.confidence <= 1
                 or segment.text[p.start:p.end] != p.source):
                 continue
-            # Never permit negation/numeric changes, including punctuation in
-            # decimals. Formatting may alter casing and spacing only.
+            # Formatting preserves letters; numeric and negation guards below
+            # additionally protect meaning-bearing signs, units and words.
             formatting = re.sub(r"[^\w]", "", p.source.casefold()) == re.sub(r"[^\w]", "", p.replacement.casefold())
             alias = any(a.casefold() == p.source.casefold() and c == p.replacement
                         for a, c in self.context.aliases.items())
             boundary = ((p.start == 0 or not segment.text[p.start - 1].isalnum())
                         and (p.end == len(segment.text) or not segment.text[p.end].isalnum()))
             numbers_unchanged = re.findall(r"\d+(?:[.,:/-]\d+)*", p.source) == re.findall(r"\d+(?:[.,:/-]\d+)*", p.replacement)
+            # Numeric spans preserve signs, percentage marks and units, too.
+            if re.search(r"\d", p.source + p.replacement):
+                numbers_unchanged = (re.sub(r"\s+", "", p.source)
+                                     == re.sub(r"\s+", "", p.replacement) and numbers_unchanged)
             # Removing spaces must not silently change 'inte' to another word.
             protected = {"inte", "ej", "icke", "aldrig", "ingen", "inget", "inga", "utan"}
             negation_unchanged = [w for w in words(p.source) if w in protected] == [w for w in words(p.replacement) if w in protected]
@@ -232,7 +236,7 @@ class Broker:
                          and len(words(p.replacement)) <= 4
                          and similarity.ratio() >= .88 and edit_budget <= 2
                          and number_words_unchanged)
-            valid_content = numbers_unchanged and negation_unchanged
+            valid_content = numbers_unchanged and negation_unchanged and number_words_unchanged
             if (formatting or alias or near_term) and boundary and valid_content and p.replacement != p.source:
                 accepted.append(p)
             elif self.emit_suggestions and boundary and valid_content and p.replacement != p.source:

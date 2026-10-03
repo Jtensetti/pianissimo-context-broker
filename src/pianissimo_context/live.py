@@ -231,7 +231,9 @@ class LiveSession:
                 state = (s.revision, self.broker.active.revision)
                 if self._processed.get(i) != state:
                     await self.broker.repair(i)
-                    self._processed[i] = (s.revision, self.broker.active.revision)
+                    self._processed[i] = (s.revision, state[1])
+                    if self.broker.active.revision != state[1]:
+                        self._wake.set()
             # A cadence review may become due during inference.
             if self.broker.review_due():
                 self._wake.set()

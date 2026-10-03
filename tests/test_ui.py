@@ -18,7 +18,7 @@ class UITests(unittest.TestCase):
                 session.push("Första segmentet.")
                 broker.emit({"type": "audio_ready"})
                 entered.set()
-                await asyncio.Event().wait()
+                await kwargs["stop_event"].wait()
         runtime = AppRuntime(capture)
         try:
             app, _ = build_app(runtime, devices=[("Microphone", 0)], models=["model"])
@@ -27,7 +27,11 @@ class UITests(unittest.TestCase):
             self.assertTrue(entered.wait(3))
             result = handlers["begin_edit"]()
             self.assertTrue(result[0])
-            self.assertTrue(result[1]["interactive"])
+            self.assertFalse(result[1]["visible"])
+            self.assertEqual(result[4]["value"], "Initial kontext")
+            self.assertTrue(result[4]["visible"])
+            poll_outputs = next(f.outputs for f in app.fns.values() if f.fn and f.fn.__name__ == "poll")
+            self.assertNotIn("context-draft", [output.elem_id for output in poll_outputs])
             # A timer response never sends a context value during editing.
             poll = handlers["poll"](True, -1)
             self.assertNotIn("value", poll[2])
@@ -35,7 +39,8 @@ class UITests(unittest.TestCase):
             saved = handlers["save_edit"]("Rättad kontext")
             self.assertFalse(saved[0])
             self.assertEqual(saved[1]["value"], "Rättad kontext")
-            self.assertFalse(saved[1]["interactive"])
+            self.assertTrue(saved[1]["visible"])
+            self.assertFalse(saved[6]["visible"])
             labels = [c["props"].get("label", "") for c in app.config["components"]]
             self.assertIn("Ljudkälla", labels)
             self.assertIn("Kontext", labels)

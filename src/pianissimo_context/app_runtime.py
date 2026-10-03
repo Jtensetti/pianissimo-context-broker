@@ -39,8 +39,7 @@ class AppRuntime:
         self._broker: AdaptiveBroker | None = None
         self._running = False
         self._closed = False
-        self._record_task: asyncio.Task | None = None
-        self._stop_requested = False
+        self._stop_event: asyncio.Event | None = None
         self._status = "Redo"
         self._message = ""
         self._segments: dict[int, str] = {}
@@ -72,7 +71,7 @@ class AppRuntime:
                 active = event["active_context"]
                 topic, summary = active["topic"], active["summary"]
                 self._context = summary if summary.startswith(topic) else "\n\n".join(t for t in (topic, summary) if t)
-                self._revision = active["revision"]
+                self._revision += 1
                 self._updated = datetime.now().astimezone().strftime("%H:%M:%S")
             elif kind == "audio_ready" and self._status != "Stoppar":
                 self._status = "Lyssnar"
@@ -88,6 +87,8 @@ class AppRuntime:
     def start(self, device: int | None, model: str, initial_context: str) -> None:
         if device is None:
             raise ValueError("Välj en ljudkälla")
+        if type(device) is not int or device < 0:
+            raise ValueError("Välj en giltig ljudkälla")
         if not isinstance(model, str) or not model.strip():
             raise ValueError("Välj en språkmodell")
         if not isinstance(initial_context, str) or len(initial_context) > 4000:
@@ -98,20 +99,21 @@ class AppRuntime:
             if self._running:
                 raise ValueError("Transkriptionen är redan startad")
             self._running, self._status, self._message = True, "Laddar", ""
-            self._stop_requested = False
+            self._stop_event = asyncio.Event()
             self._segments = {}
-            self._context, self._revision, self._updated = initial_context, 0, ""
+            self._context, self._updated = initial_context, ""
+            self._revision += 1
             self._broker = None
-            self._future = asyncio.run_coroutine_threadsafe(self._record(int(device), model.strip(), initial_context), self._loop)
+            self._future = asyncio.run_coroutine_threadsafe(
+                self._record(device, model.strip(), initial_context, self._stop_event), self._loop)
 
-    async def _record(self, device: int, model: str, initial: str):
-        self._record_task = asyncio.current_task()
+    async def _record(self, device: int, model: str, initial: str, stop_event: asyncio.Event):
         try:
             broker = AdaptiveBroker(initial_context=initial, controller=Ollama(model), emit=self._event)
             self._broker = broker
-            if self._stop_requested:
+            if stop_event.is_set():
                 return
-            await self.capture(broker, model_name="KlangAI/pianissimo-sv", device=device)
+            await self.capture(broker, model_name="KlangAI/pianissimo-sv", device=device, stop_event=stop_event)
         except asyncio.CancelledError:
             pass
         except Exception as exc:
@@ -128,24 +130,27 @@ class AppRuntime:
             if not self._running or self._status == "Stoppar":
                 return
             self._status = "Stoppar"
-            self._stop_requested = True
-        # Cancel the actual task, not its concurrent Future. The latter marks
-        # itself done before capture cleanup has finished and would permit a
-        # premature second recording or shutdown of an active decoding thread.
-        asyncio.run_coroutine_threadsafe(self._cancel_recording(), self._loop)
-
-    async def _cancel_recording(self):
-        if self._record_task is not None and not self._record_task.done():
-            self._record_task.cancel()
+            stop_event = self._stop_event
+        # The event belongs to this recording, so a late stop cannot cancel a
+        # later recording. Capture closes the input and drains accepted audio.
+        self._loop.call_soon_threadsafe(stop_event.set)
 
     def update_context(self, text: str) -> None:
         if not isinstance(text, str) or not text.strip() or len(text) > 4000:
             raise ValueError("Ange en kontext på högst 4 000 tecken")
+        with self._lock:
+            if self._closed or not self._running or self._status == "Stoppar":
+                raise ValueError("Ingen aktiv transkription")
         async def update():
             if self._broker is None or self._broker._finished:
                 raise ValueError("Ingen aktiv transkription")
             self._broker.set_manual_context(text)
-        asyncio.run_coroutine_threadsafe(update(), self._loop).result(timeout=5)
+        future = asyncio.run_coroutine_threadsafe(update(), self._loop)
+        try:
+            future.result(timeout=5)
+        except TimeoutError:
+            future.cancel()
+            raise RuntimeError("Kontexten kunde inte sparas") from None
 
     def snapshot(self) -> Snapshot:
         with self._lock:

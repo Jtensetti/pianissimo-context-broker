@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from pianissimo_context.asr import NemoASR
+from pianissimo_context.asr import NemoASR, PhraseBoostingUnavailable
 
 
 class FakeModel:
@@ -52,3 +52,12 @@ class AdapterTests(unittest.TestCase):
         asr = NemoASR(FakeModel())
         with self.assertRaises(ValueError):
             asr.update_glossary([""])
+
+    def test_failed_restore_is_fatal_not_a_recoverable_boost_warning(self):
+        class BrokenModel(FakeModel):
+            def change_decoding_strategy(self, config):
+                raise RuntimeError("Decoder failure")
+        asr = NemoASR(BrokenModel())
+        with self.assertRaises(RuntimeError) as raised:
+            asr.update_glossary(["Svea"])
+        self.assertNotIsInstance(raised.exception, PhraseBoostingUnavailable)

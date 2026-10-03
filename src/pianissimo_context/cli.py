@@ -43,7 +43,7 @@ async def run(args):
         await transcribe_microphone(broker, model_name=args.asr_model,
                                    chunk_seconds=args.chunk_seconds, device=args.device)
     else:
-        from .asr import NemoASR
+        from .asr import NemoASR, PhraseBoostingUnavailable
         asr = NemoASR.load(args.asr_model)
         with wave.open(args.file, "rb") as source, tempfile.TemporaryDirectory() as directory:
             if (source.getframerate(), source.getnchannels(), source.getsampwidth()) != (16000, 1, 2):
@@ -56,7 +56,7 @@ async def run(args):
                     chunk.writeframes(data)
                 try:
                     asr.update_glossary(broker.glossary())
-                except RuntimeError:
+                except PhraseBoostingUnavailable:
                     output({"type": "asr_warning", "message": "Phrase boosting unavailable; using base decoder"})
                 text = await asyncio.to_thread(asr.transcribe, path)
                 duration = len(data) / 32000

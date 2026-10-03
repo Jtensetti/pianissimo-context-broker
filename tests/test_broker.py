@@ -115,6 +115,21 @@ class BrokerTests(unittest.IsolatedAsyncioTestCase):
                 Ollama("local", url)
         Ollama("local")
 
+    async def test_sign_percentage_currency_and_unit_changes_are_rejected(self):
+        for source, replacement in [("-5", "5"), ("−5", "5"), ("5%", "5"),
+                                    ("5 mg", "5 g"), ("5 mW", "5 MW"), ("12 €", "12 $")]:
+            broker = Broker(Context(terms=(replacement,)), allow_context_repairs=True)
+            s = broker.add(source)
+            self.assertFalse(broker.apply(s.id, 0, [Patch(0, len(source), source, replacement, .99)]), source)
+            self.assertEqual(s.text, source)
+
+    async def test_malformed_terms_cannot_partially_apply_a_reply(self):
+        broker = Broker(controller=Stub({"patches": [{"start": 0, "end": 3, "source": "hej",
+                                    "replacement": "Hej", "confidence": .99}], "terms": "invalid"}))
+        s = broker.add("hej")
+        self.assertFalse(await broker.repair(s.id))
+        self.assertEqual(s.text, "hej")
+
 
 if __name__ == "__main__":
     unittest.main()
