@@ -7,6 +7,7 @@ import os
 from urllib.request import Request, ProxyHandler, build_opener
 
 from .app_runtime import AppRuntime
+from .llm import RECOMMENDED_MODEL
 
 
 def input_devices():
@@ -43,10 +44,13 @@ def build_app(runtime: AppRuntime | None = None, *, devices=None, models=None):
             devices, default = [], None
     else:
         default = devices[0][1] if devices else None
-    models = ollama_models() if models is None else models
-    model_default = os.environ.get("PIANISSIMO_OLLAMA_MODEL") or (models[0] if models else None)
+    models = list(ollama_models() if models is None else models)
+    model_default = os.environ.get("PIANISSIMO_OLLAMA_MODEL") or (
+        RECOMMENDED_MODEL if RECOMMENDED_MODEL in models else models[0] if models else RECOMMENDED_MODEL)
+    if model_default not in models:
+        models.append(model_default)
     css = """
-    .gradio-container {max-width:1120px !important; margin:auto;}
+    .gradio-container {max-width:1280px !important; margin:auto;}
     #transcript textarea {font-size:16px; line-height:1.7;}
     #context textarea, #context-draft textarea {font-size:15px; line-height:1.6;}
     footer {display:none !important;}
@@ -55,6 +59,7 @@ def build_app(runtime: AppRuntime | None = None, *, devices=None, models=None):
         gr.Markdown("# Pianissimo")
         editing = gr.State(False)
         displayed_revision = gr.State(-1)
+        edit_revision = gr.State(-1)
         with gr.Row():
             audio = gr.Dropdown(devices, value=default, label="Ljudkälla", scale=4)
             refresh = gr.Button("Uppdatera", scale=1)
@@ -66,15 +71,22 @@ def build_app(runtime: AppRuntime | None = None, *, devices=None, models=None):
             start = gr.Button("Starta", variant="primary")
             stop = gr.Button("Stoppa", interactive=False)
         with gr.Row():
-            transcript = gr.Textbox(label="Transkript", lines=20, interactive=False,
+            transcript = gr.Textbox(label="Transkript", lines=24, interactive=False,
                                     autoscroll=True, elem_id="transcript", scale=3)
             with gr.Column(scale=2):
-                context = gr.Textbox(label="Kontext", lines=13, interactive=False,
-                                     max_length=4000, elem_id="context")
-                # Draft is a separate component: even an in-flight timer response
-                # from before editing began can only update the read-only view.
-                context_draft = gr.Textbox(label="Kontext", lines=13, interactive=True,
-                                           max_length=4000, visible=False, elem_id="context-draft")
+                with gr.Column() as context_view:
+                    background = gr.Textbox(label="Bakgrund", lines=3, interactive=False)
+                    context = gr.Textbox(label="Aktuellt ämne", lines=5, interactive=False, elem_id="context")
+                    memory = gr.Dataframe(headers=["Ämne", "Kontext"], datatype=["str", "str"],
+                                          type="array", value=[], col_count=(2, "fixed"),
+                                          label="Tidigare ämnen", interactive=False)
+                # Timer responses never target any of these draft components.
+                with gr.Column(visible=False) as context_editor:
+                    background_draft = gr.Textbox(label="Bakgrund", lines=3, max_length=4000, elem_id="background-draft")
+                    context_draft = gr.Textbox(label="Aktuellt ämne", lines=5, max_length=1000, elem_id="context-draft")
+                    memory_draft = gr.Dataframe(headers=["Ämne", "Kontext"], datatype=["str", "str"],
+                        type="array", value=[], col_count=(2, "fixed"), label="Tidigare ämnen",
+                        interactive=True, elem_id="memory-draft")
                 with gr.Row():
                     edit = gr.Button("Redigera", interactive=False)
                     save = gr.Button("Spara", variant="primary", visible=False)
@@ -85,62 +97,62 @@ def build_app(runtime: AppRuntime | None = None, *, devices=None, models=None):
 
         def poll(is_editing, revision):
             s = runtime.snapshot()
-            new_context = gr.skip() if is_editing or revision == s.revision else gr.update(value=s.context)
-            return (s.transcript, s.status, new_context, revision if is_editing else s.revision,
-                    s.updated, gr.update(interactive=not s.running), gr.update(interactive=s.running and s.status != "Stoppar"),
-                    gr.update(interactive=s.running and not is_editing),
+            changed = not is_editing and revision != s.revision
+            return (s.transcript, s.status,
+                    gr.update(value=s.context) if changed else gr.skip(),
+                    gr.update(value=s.background) if changed else gr.skip(),
+                    gr.update(value=s.memory) if changed else gr.skip(),
+                    revision if is_editing else s.revision, s.updated,
+                    gr.update(interactive=not s.running),
+                    gr.update(interactive=s.running and s.status != "Stoppar"),
+                    gr.update(interactive=s.running and s.status != "Stoppar" and not is_editing),
                     gr.update(value=s.message, visible=bool(s.message)))
 
         timer.tick(poll, [editing, displayed_revision],
-                   [transcript, status, context, displayed_revision, updated, start, stop, edit, message],
-                   queue=False, show_progress="hidden")
+                   [transcript, status, context, background, memory, displayed_revision,
+                    updated, start, stop, edit, message], queue=False, show_progress="hidden")
 
-        def start_recording(device, model_name, background):
+        controls = [editing, context_view, context_editor, edit, save, cancel, message]
+
+        def closed_editor():
+            return (False, gr.update(visible=True), gr.update(visible=False), gr.update(visible=True),
+                    gr.update(visible=False), gr.update(visible=False), gr.update(value="", visible=False))
+
+        def start_recording(device, model_name, briefing):
             try:
-                runtime.start(device, model_name, background)
-                return (gr.update(value="", visible=False), False,
-                        gr.update(value=background, interactive=False, visible=True), -1,
-                        gr.update(visible=False), gr.update(visible=False),
-                        gr.update(visible=False, value=""), gr.update(visible=True))
+                runtime.start(device, model_name, briefing)
+                return closed_editor()
             except ValueError as exc:
                 runtime.notice(str(exc))
-                return (gr.update(value=str(exc), visible=True), gr.skip(), gr.skip(),
-                        gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip())
+                return (*[gr.skip() for _ in range(6)], gr.update(value=str(exc), visible=True))
 
-        start.click(start_recording, [audio, model, initial],
-                    [message, editing, context, displayed_revision, save, cancel, context_draft, edit], queue=False)
+        start.click(start_recording, [audio, model, initial], controls, queue=False)
         stop.click(runtime.stop, queue=False)
 
         def begin_edit():
             s = runtime.snapshot()
-            return (True, gr.update(visible=False), gr.update(visible=True), gr.update(visible=True),
-                    gr.update(value=s.context, visible=True), gr.update(visible=False))
+            return (True, gr.update(visible=False), gr.update(visible=True), gr.update(visible=False),
+                    gr.update(visible=True), gr.update(visible=True), gr.update(value="", visible=False),
+                    s.background, s.context, s.memory, s.revision)
 
-        edit.click(begin_edit, outputs=[editing, context, save, cancel, context_draft, edit], queue=False)
+        edit.click(begin_edit, outputs=controls + [background_draft, context_draft, memory_draft, edit_revision], queue=False)
 
-        def save_edit(text):
+        def save_edit(briefing, current, topics, revision):
             try:
-                runtime.update_context(text)
+                runtime.update_stack(briefing, current, topics, revision)
                 runtime.notice("")
-                s = runtime.snapshot()
-                return (False, gr.update(value=s.context, visible=True), s.revision,
-                        gr.update(visible=False), gr.update(visible=False), gr.update(value="", visible=False),
-                        gr.update(visible=False, value=""), gr.update(visible=True))
+                return closed_editor()
             except (ValueError, RuntimeError) as exc:
                 runtime.notice(str(exc))
-                return (True, gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.update(value=str(exc), visible=True),
-                        gr.skip(), gr.skip())
+                return (*[gr.skip() for _ in range(6)], gr.update(value=str(exc), visible=True))
 
-        save.click(save_edit, context_draft,
-                   [editing, context, displayed_revision, save, cancel, message, context_draft, edit], queue=False)
+        save.click(save_edit, [background_draft, context_draft, memory_draft, edit_revision], controls, queue=False)
 
         def cancel_edit():
-            s = runtime.snapshot()
-            return (False, gr.update(value=s.context, visible=True), s.revision,
-                    gr.update(visible=False), gr.update(visible=False), gr.update(visible=False, value=""),
-                    gr.update(visible=True))
+            runtime.notice("")
+            return closed_editor()
 
-        cancel.click(cancel_edit, outputs=[editing, context, displayed_revision, save, cancel, context_draft, edit], queue=False)
+        cancel.click(cancel_edit, outputs=controls, queue=False)
 
         def refresh_inputs():
             try:

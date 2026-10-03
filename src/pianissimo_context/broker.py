@@ -9,6 +9,8 @@ from difflib import SequenceMatcher
 from dataclasses import asdict, dataclass, field
 from typing import Callable, Protocol
 
+from .phonetics import changes_stay_close, phonetically_close
+
 
 def words(text: str) -> list[str]:
     return re.findall(r"\w+", text.casefold(), flags=re.UNICODE)
@@ -53,6 +55,7 @@ class Segment:
     committed: bool = False
     start: float | None = None
     end: float | None = None
+    review_status: str = "pending"
 
 
 @dataclass(frozen=True)
@@ -63,6 +66,7 @@ class Patch:
     replacement: str
     confidence: float
     reason: str = ""
+    kind: str = ""
 
 
 class Controller(Protocol):
@@ -92,6 +96,7 @@ class Broker:
         self._busy = False
         self.allow_context_repairs = allow_context_repairs
         self.emit_suggestions = emit_suggestions
+        self.allow_semantic_repairs = False
 
     def repair_payload(self, segment: Segment, revision: int, original: str) -> dict:
         return {"context": asdict(self.context), "glossary": self.glossary(),
@@ -152,6 +157,7 @@ class Broker:
             self.apply(segment_id, revision, patches)
             revision, original = segment.revision, segment.text
         if self.controller is None:
+            segment.review_status = "unavailable"
             return bool(patches)
         payload = self.repair_payload(segment, revision, original)
         context_version = self.context_version()
@@ -167,7 +173,20 @@ class Broker:
             proposals = result.get("patches", [])
             if not isinstance(proposals, list) or len(proposals) > 32:
                 raise ValueError("Invalid patch list")
-            parsed = [Patch(**p) for p in proposals]
+            parsed = []
+            for proposal in proposals:
+                if not isinstance(proposal, dict):
+                    raise ValueError("Expected patch object")
+                proposal = proposal.copy()
+                if "start" not in proposal and "end" not in proposal:
+                    source = proposal.get("source")
+                    if not isinstance(source, str) or not source:
+                        raise ValueError("Expected exact source text")
+                    start = original.find(source)
+                    if start < 0 or original.find(source, start + 1) >= 0:
+                        continue  # No guessing when the source is ambiguous.
+                    proposal.update(start=start, end=start + len(source))
+                parsed.append(Patch(**proposal))
             candidates = result.get("terms", [])
             if not isinstance(candidates, list) or len(candidates) > 100:
                 raise ValueError("Invalid term list")
@@ -181,10 +200,12 @@ class Broker:
             self.dynamic_terms = list(dict.fromkeys(grounded + self.dynamic_terms))[:100]
             if before != self.glossary():
                 self.emit({"type": "glossary", "phrases": self.glossary()})
+            segment.review_status = "reviewed"
             return applied
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            segment.review_status = "error"
             # Do not log transcript, prompts, response, or potentially sensitive
             # exception messages. Fail open to original ASR text.
             self.emit({"type": "controller_error", "error": type(exc).__name__})
@@ -237,7 +258,16 @@ class Broker:
                          and similarity.ratio() >= .88 and edit_budget <= 2
                          and number_words_unchanged)
             valid_content = numbers_unchanged and negation_unchanged and number_words_unchanged
-            if (formatting or alias or near_term) and boundary and valid_content and p.replacement != p.source:
+            # Model classification is not evidence: every lexical correction
+            # must independently pass the pronunciation-proximity gate below.
+            semantic = (self.allow_semantic_repairs and p.kind == "asr_error"
+                        and isinstance(p.reason, str) and bool(p.reason.strip())
+                        and len(p.source) <= 80
+                        and len(p.replacement) <= 80
+                        and 1 <= len(words(p.source)) <= 4
+                        and 1 <= len(words(p.replacement)) <= 4)
+            phonetic = phonetically_close(p.source, p.replacement)
+            if (formatting or ((alias or near_term or semantic) and phonetic)) and boundary and valid_content and p.replacement != p.source:
                 accepted.append(p)
             elif self.emit_suggestions and boundary and valid_content and p.replacement != p.source:
                 self.emit({"type": "suggestion", "segment_id": segment_id, "base_revision": revision,
@@ -248,6 +278,8 @@ class Broker:
         text = segment.text
         for p in reversed(accepted):
             text = text[:p.start] + p.replacement + text[p.end:]
+        if not changes_stay_close(segment.raw, text):
+            return False  # Repeated small repairs must not drift from RAW speech.
         segment.text, segment.revision = text, revision + 1
         self.emit({"type": "patch", "segment_id": segment_id, "base_revision": revision,
                    "revision": segment.revision, "patches": [asdict(p) for p in accepted], "text": text})

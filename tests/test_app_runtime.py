@@ -12,10 +12,17 @@ class RuntimeTests(unittest.TestCase):
         async def capture(broker, **kwargs):
             # Exercise the real broker/session, with no microphone or models.
             broker.controller = None
+            original_emit = broker.emit
+            def emit(event):
+                original_emit(event)
+                if event["type"] == "display":
+                    entered.set()
+            broker.emit = emit
             async with LiveSession(broker) as session:
                 session.push("Hej")
                 broker.emit({"type": "audio_ready"})
-                entered.set()
+                # Readiness here means reviewed/fallback text reached the UI,
+                # not merely that raw ASR was queued on another thread.
                 await kwargs["stop_event"].wait()
         runtime = AppRuntime(capture)
         try:

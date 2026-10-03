@@ -1,17 +1,17 @@
 # Pianissimo Context Broker
 
 En lokal kontextcontroller för **live-transkribering med Pianissimo**. Ge en
-kort beskrivning av samtalet, låt Pianissimo leverera råtext direkt och låt en
-liten lokal språkmodell föreslå rättningar och följa hur ämnet utvecklas.
+kort beskrivning av samtalet, låt Pianissimo transkribera och låt en liten lokal språkmodell granska
+texten före visning, rätta hörfel och följa hur ämnet utvecklas.
 
-Version 0.3 innehåller fri initial kontext, kontextbedömning var 25:e sekund,
-begränsat samtalsminne, konservativa patchar, JSONL-events och valfri
+Version 0.4 innehåller fri initial kontext, kontextbedömning var 25:e sekund,
+redigerbart samtalsminne, lokala kontextuella patchar, JSONL-events och valfri
 mikrofoninmatning. Det är en körbar prototyp; verklig modellkvalitet och
 hårdvarulatens är ännu inte uppmätta.
 
 ## Lokal app
 
-Version 0.3 har ett lokalt webbläsargränssnitt:
+Version 0.4 har ett lokalt webbläsargränssnitt:
 
 ```bash
 python -m pip install -e '.[app,asr]'
@@ -24,12 +24,18 @@ instruction-modell. Gränssnittet öppnas på `http://127.0.0.1:7860`. Välj
 **Inställningar** och tryck **Starta**. Ljudenheterna kommer från datorn där
 appen körs. **Uppdatera** läser om ljudenheter och Ollama-modeller.
 
-**Transkript** och **Kontext** uppdateras automatiskt. **Redigera** öppnar
-kontextfältet; **Spara** skickar den nya texten till brokern, **Avbryt** återgår
-till den senaste modellkontexten. Under redigering ersätter timeruppdateringar
-inte utkastet. Manuella ändringar lagras som korrigerad bakgrund, medan den
-ursprungliga initialtexten bevaras separat. LLM-svar på äldre kontext avvisas,
-både för kontextuppdateringar och transkriptpatchar.
+**Transkript** visar text efter språkmodellens granskning. Råtext och patchar
+finns kvar som interna events; frontend använder `display`. Vid modellfel eller
+om texten hinner låsas utan slutförd granskning visas originaltext med ett
+uttryckligt meddelande. Ljudet fortsätter fångas medan språkmodellen arbetar.
+
+Kontextvyn visar **Bakgrund**, **Aktuellt ämne** och **Tidigare ämnen**.
+**Redigera** öppnar separata utkast till samtliga delar. **Spara** uppdaterar
+hela minnet atomiskt; **Avbryt** återgår till den senaste kontexten. Timer- och
+modellsvar kan inte skriva över utkasten. Om kontexten ändrats sedan redigeringen
+öppnades avvisas sparningen med ett meddelande, så att nytillkomna ämnen inte
+försvinner. Manuella ändringar ogiltigförklarar pågående modellsvar. Ursprunglig
+initialtext bevaras separat, medan rättad bakgrund får företräde i modellen.
 
 **Stoppa** stänger ljudflödet och transkriberar klart redan köat ljud, inklusive
 det sista ofullständiga klippet. Transkriptet ligger kvar. Statusen är
@@ -49,6 +55,50 @@ För befintliga installationer utan den nya startkommandolänken fungerar också
 python -m pianissimo_context.app
 ```
 
+## Språkmodell i Ollama
+
+Rekommenderad startkandidat, kontrollerad 2026-10-03: **`qwen3.5:4b`**.
+Det är en bedömning utifrån modellstorlek och stödda funktioner, inte en uppmätt
+vinnare för svensk ASR-rättning. Ollama anger cirka 3,4 GB för 4B-taggen.
+Som jämförelse anges 6,6 GB för `qwen3.5:9b` och 6,6–9,5 GB för `gemma4:e4b`.
+Filstorlek är inte total RAM/VRAM: kontextcache, runtime och Pianissimo tillkommer.
+Välj 4B som första test när samma maskin ska köra båda modellerna. Jämför 9B
+eller Gemma E4B om mer minne finns och rättningskvaliteten motiverar fördröjningen.
+
+```bash
+ollama pull qwen3.5:4b
+ollama run qwen3.5:4b
+# Avsluta chatten med /bye efter att modellen laddats.
+pianissimo-app
+```
+
+Appen föredrar den rekommenderade modellen om den är installerad. Du kan välja
+annan installerad modell. Inga Ollama-modeller laddas ned automatiskt.
+Anropen använder `think: false`, JSON-schema, temperatur 0, 16 384 tokens
+kontext, högst 1 024 outputtokens och `keep_alive: "10m"`. Inställningarna är
+valda för korta strukturerade svar; de är inte generella benchmarkinställningar.
+Thinking avaktiveras via API, inte med `/no_think` i texten.
+Modellen anger exakt källtext för varje patch. Brokern beräknar positionen och
+avvisar tvetydiga förekomster, så att små modeller slipper räkna teckenindex.
+
+Ett litet syntetiskt texttest finns för jämförelse på din maskin:
+
+```bash
+python examples/evaluate_model.py --models qwen3.5:4b qwen3.5:9b gemma4:e4b
+```
+
+Installera och värm respektive modell först. Testet använder riktiga lokala
+Ollama-anrop och produktens patchregler. Det redovisar exakta rättningar,
+felstatus samt median/p95 svarstid. Det är tio textfall, ingen WER-mätning eller
+ersättning för en inspelning med Pianissimo igång samtidigt. En timeout räknas
+som misslyckat fall, även om originaltexten råkade vara korrekt.
+
+Källor: [Qwen3.5 i Ollama](https://ollama.com/library/qwen3.5),
+[Gemma 4 i Ollama](https://ollama.com/library/gemma4),
+[Qwen3.5-4B modellkort](https://huggingface.co/Qwen/Qwen3.5-4B),
+[Ollama thinking](https://docs.ollama.com/capabilities/thinking),
+[Ollama strukturerade svar](https://docs.ollama.com/capabilities/structured-outputs).
+
 ## Så följer brokern samtalet
 
 Tre delar av kontexten hålls separat:
@@ -57,9 +107,11 @@ Tre delar av kontexten hålls separat:
 2. **Aktuell kontext** – språkmodellens preliminära ämnesbild omprövas var
    20–30:e sekund när det finns nytt tal. Standard är 25 sekunder, med upp
    till 30 sekunders råtext som underlag.
-3. **Samtalsminne** – upp till åtta tidigare ämnen, korta sammanfattningar och
-   belägg bevaras när ämnet byts. Modellen kan återknyta till en tidigare
-   diskussion utan att hela transkriptet skickas med varje gång.
+3. **Samtalsminne** – tidigare ämnen, korta sammanfattningar och belägg
+   bevaras under sessionen, även efter åtta ämnesbyten. Till varje modellanrop
+   väljs högst åtta ämnen: fyra senaste samt fyra utifrån ordöverlappning med
+   aktuell råtext och ämne. Hela arkivet är synligt och redigerbart i appen.
+   Urvalet är en enkel heuristik och kan missa en indirekt återkoppling.
 
 Kontextens sammanfattningar är **hypoteser**, inte ett register över verifierade
 fakta. Nya roller, identiteter och sakuppgifter ska inte härledas till journalen.
@@ -102,7 +154,7 @@ pianissimo-context --ollama-model DITT_MODELLNAMN --initial-context "Detta är e
 ```
 
 Skicka en rad per **nytt, icke överlappande ASR-segment** till stdin. `text` är
-ett alias för `live`. stdout ger JSONL-events. Råtexten väntar inte på LLM.
+ett alias för `live`. stdout ger JSONL-events. Inmatningen väntar inte på LLM; klienten visar endast `display`-events.
 Avsluta med EOF. `--review-seconds 25` anger kontextkadens.
 
 * Vid start extraherar LLM aktuellt ämne och relevanta fraser ur initialtexten.
@@ -144,18 +196,40 @@ inte då. Appens **Stoppa** behandlar däremot kvarvarande ljud klart.
 Detta är chunkad live-ASR, **inte cache-aware neural streaming**. Klippgränser
 kan dela ord; överlappningssammanfogning, diarisation och ordnivå-confidence är
 inte implementerade. Råtext kommer efter klippets ASR; språkmodellens rättningar
-kommer därefter utan att blockera nästa mikrofonklipp. Den praktiska fördröjningen
+granskas innan frontend visar texten, utan att blockera nästa mikrofonklipp. Den praktiska fördröjningen
 beror på klipplängd, hårdvara och modeller.
 
 ## Vad får automatiskt rättas?
 
 * Explicit angivna alias: exempelvis `aj sveden` → `AI Sweden`.
 * Kapitalisering, interpunktion och blanksteg med bibehållen bokstavs-/sifferföljd.
-* I live-läge: små felskrivningar av **aktuella domäntermer och sammansättningar**,
+* I live-läge: modellen kan klassificera ett lokalt hörfel som `asr_error`,
+  med en motivering och confidence minst 0.95. Då krävs inte hög
+  stavningslikhet, men rättningen måste även klara kodens oberoende uttalskontroll:
+  `aj sveden` → `AI Sweden` är möjligt med stöd av kontext.
+  Varje sådan patch får omfatta högst fyra ord och 80 tecken på vardera sidan.
+  Sammanhanget hjälper modellen, men är inget akustiskt bevis.
+* Även små felskrivningar av **aktuella domäntermer och sammansättningar**,
   inte bara namn. Ersättningen måste finnas i aktiv ordlista; källan måste vara
   6–60 tecken, högst fyra ord, med hög stränglikhet och högst två teckens
   ändringsbudget. Exempel: `transkriberingsmodulen` → `transkriberingsmodellen`
   när den senare är en aktiv term.
+
+Alla lexikala byten, även alias och nära domäntermer, måste vara ljudmässigt
+närliggande enligt en försiktig svensk textbaserad uttalsapproximation.
+Den bevarar vokaler och ljudföljd, normaliserar vissa stavningsvarianter
+(exempelvis w/v, dubbelkonsonanter och AI/aj), och tillåter högst två
+ljudnyckeländringar med högst 20 procent relativt avstånd. Mycket korta ord
+kräver identisk ljudnyckel. Oförändrade omgivande ord räknas inte in i likheten.
+Ändringar kontrolleras även mot ursprunglig råtext, så att flera små rättningar
+inte kan glida allt längre från ASR-output.
+
+`ledsen` → `deprimerad` stoppas även med högsta LLM-confidence och klinisk
+kontext. Avvisade förslag ändrar inte transkriptet. Detta är en heuristik från
+text, **inte fonemigenkänning från ljud eller ett bevis för bibehållen betydelse**.
+Närliggande ljud kan betyda olika saker; engelska uttal, dialekter och okända
+förkortningar kan också ge för konservativa resultat. Kontexten väljer en
+kandidat; modellens motivering kan aldrig ersätta uttalskravet.
 
 Exakt källtext, rätt offset/revision och olåst segment krävs. Patchar som
 innehåller siffror får bara ändra blanksteg: bland annat minustecken,
@@ -166,9 +240,9 @@ vara minst 0.95, men det är en **heuristik, ingen akustisk sannolikhet**.
 Stränglikhet är inte heller ett bevis för vad som sades: nära ord kan ha olika
 betydelse. Validera automatisk termrättning på egna inspelningar.
 
-Större ordbyten som LLM tror kan vara transkriptionsfel blir ett `suggestion`
+Förslag som inte klarar reglerna för en automatisk rättning blir ett `suggestion`
 med `text_changed=false`. De skriver inte om den visade transkriptionen.
-`--suggestions-only` stänger av automatiska nära termbyten; uttryckliga alias
+`--suggestions-only` stänger av både kontextuella hörfelsrättningar och nära termbyten; uttryckliga alias
 och formateringspatchar är fortfarande aktiva. Ett ord får aldrig ersättas
 bara för att meningen verkar främmande för ämnet. Ingen akustisk verifiering
 eller resolver av osäkra ljuddelar finns ännu.
@@ -194,20 +268,22 @@ async def consume(raw_segments):
 begränsade notifieringar och stängning. En session/broker per samtal, alla
 broker-anrop på samma asyncio-loop. Callbacken får inte blockera. Committed
 segment frigörs från RAM, så klienten måste spara dem genom commit-eventen.
-Sammanfattningsminnet är begränsat till åtta ämnen och råhistoriken till
-30 sekunder, max 200 segment/8 000 tecken i kontextunderlaget.
+Ämnesarkivet bevaras i RAM under sessionen. Modellens minnesurval är begränsat
+till åtta ämnen och råhistoriken till 30 sekunder, max 200 segment/8 000 tecken
+i kontextunderlaget. En ny inspelning börjar med ett nytt arkiv.
 
 Den enklare `Broker` behåller det tidigare API:t och tillåter endast alias och
 formateringspatchar som standard. Den har ingen automatisk kontextkadens.
 
 | Event | Klientens åtgärd |
 | --- | --- |
-| `raw` | Visa råtext, spara ID/revision och original |
-| `patch` | Matcha base_revision, ersätt segmentets text och revision |
+| `raw` | Intern råtext för diagnostik; visa inte i frontend |
+| `display` | Visa komplett segmenttext, sortera på segment_id; kontrollera review_status |
+| `patch` | Intern ändringslogg; frontend väntar på `display` |
 | `commit` | Lås och spara segmentets sluttext |
-| `context` | Visa eventuell ämnesbild; diagnostik, inte journalfakta |
+| `context` | Visa background, active_context och remembered_topics |
 | `glossary` | Uppdatera ASR-ordlista inför nästa decoding |
-| `suggestion` | Visa ett osäkert förslag separat; ändra inte texten |
+| `suggestion` | Oanvänt rättningsförslag för diagnostik; visas inte i appen |
 | `controller_error` | Behåll text och tidigare kontext |
 | `audio_ready` | Mikrofonflödet förberett |
 | `audio_warning`, `audio_drop`, `asr_warning` | Visa aktuell ljud-/ASR-begränsning |
@@ -247,7 +323,7 @@ Ingen inbyggd molninferens eller telemetri. Modellvikter hämtas vid första
 installation/laddning; inferens sker lokalt. JSONL-events innehåller transkript
 och kontext: din app bestämmer lagring och åtkomst.
 
-Enhetstester täcker patchskydd, råtext först, låsning under LLM-anrop, decoder-
+Enhetstester täcker patchskydd, granskning före visning, låsning under LLM-anrop, decoder-
 återställning, initialtext, kadens, råtextbelägg, ämnesminne, termers livslängd,
 ämnesbyte, tystnad och parallell råtextinmatning under kontextanalys.
 CI kör kärnan på Python 3.11–3.13. NeMo och språkmodeller testas med dubblar.

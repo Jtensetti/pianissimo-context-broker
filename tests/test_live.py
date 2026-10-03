@@ -91,7 +91,7 @@ class AdaptiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await b.review_context())
         self.assertEqual(len(self.controller.reviews), 1)
 
-    async def test_memory_is_bounded_and_raw_history_expires(self):
+    async def test_full_archive_retained_prompt_memory_bounded_and_raw_history_expires(self):
         b = self.make_broker()
         await b.review_context()
         for i in range(12):
@@ -100,7 +100,9 @@ class AdaptiveTests(unittest.IsolatedAsyncioTestCase):
             b.add(phrase)
             self.controller.response = {"topic": phrase, "terms": [phrase], "evidence": [phrase]}
             await b.review_context()
-        self.assertEqual(len(b.remembered_topics), 8)
+        self.assertEqual(len(b.remembered_topics), 12)
+        self.assertEqual(len(b.memory_payload()), 8)
+        self.assertEqual(b.remembered_topics[0]["topic"], "Pianissimo och Svea")
         self.now += 31
         self.assertEqual(b.recent_raw(), "")
         self.assertEqual(b.initial_context, INITIAL)

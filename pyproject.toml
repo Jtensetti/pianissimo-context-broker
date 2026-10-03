@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pianissimo-context-broker"
-version = "0.3.0"
+version = "0.4.0"
 description = "Local, conservative context controller for Swedish speech recognition"
 requires-python = ">=3.11"
 dependencies = []
