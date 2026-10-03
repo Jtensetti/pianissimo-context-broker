@@ -205,7 +205,8 @@ beror på klipplängd, hårdvara och modeller.
 * Kapitalisering, interpunktion och blanksteg med bibehållen bokstavs-/sifferföljd.
 * I live-läge: modellen kan klassificera ett lokalt hörfel som `asr_error`,
   med en motivering och confidence minst 0.95. Då krävs inte hög
-  stavningslikhet: `aj sveden` → `AI Sweden` är möjligt med stöd av kontext.
+  stavningslikhet, men rättningen måste även klara kodens oberoende uttalskontroll:
+  `aj sveden` → `AI Sweden` är möjligt med stöd av kontext.
   Varje sådan patch får omfatta högst fyra ord och 80 tecken på vardera sidan.
   Sammanhanget hjälper modellen, men är inget akustiskt bevis.
 * Även små felskrivningar av **aktuella domäntermer och sammansättningar**,
@@ -213,6 +214,22 @@ beror på klipplängd, hårdvara och modeller.
   6–60 tecken, högst fyra ord, med hög stränglikhet och högst två teckens
   ändringsbudget. Exempel: `transkriberingsmodulen` → `transkriberingsmodellen`
   när den senare är en aktiv term.
+
+Alla lexikala byten, även alias och nära domäntermer, måste vara ljudmässigt
+närliggande enligt en försiktig svensk textbaserad uttalsapproximation.
+Den bevarar vokaler och ljudföljd, normaliserar vissa stavningsvarianter
+(exempelvis w/v, dubbelkonsonanter och AI/aj), och tillåter högst två
+ljudnyckeländringar med högst 20 procent relativt avstånd. Mycket korta ord
+kräver identisk ljudnyckel. Oförändrade omgivande ord räknas inte in i likheten.
+Ändringar kontrolleras även mot ursprunglig råtext, så att flera små rättningar
+inte kan glida allt längre från ASR-output.
+
+`ledsen` → `deprimerad` stoppas även med högsta LLM-confidence och klinisk
+kontext. Avvisade förslag ändrar inte transkriptet. Detta är en heuristik från
+text, **inte fonemigenkänning från ljud eller ett bevis för bibehållen betydelse**.
+Närliggande ljud kan betyda olika saker; engelska uttal, dialekter och okända
+förkortningar kan också ge för konservativa resultat. Kontexten väljer en
+kandidat; modellens motivering kan aldrig ersätta uttalskravet.
 
 Exakt källtext, rätt offset/revision och olåst segment krävs. Patchar som
 innehåller siffror får bara ändra blanksteg: bland annat minustecken,

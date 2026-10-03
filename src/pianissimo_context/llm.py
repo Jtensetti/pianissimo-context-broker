@@ -18,6 +18,12 @@ For example, with AI Sweden in context, "aj sveden" -> "AI Sweden" is an
 asr_error if the utterance supports that reading. Phonetic similarity need not
 be spelling similarity. Use small patches of at most four words, never rewrite
 a sentence to make it fit the topic. Explain the recognition error briefly.
+Only propose replacements that could sound almost the same as the source.
+Context selects among sound-near candidates; semantic plausibility alone is
+insufficient. "ledsen" -> "deprimerad" is forbidden even in a clinical context:
+it is a different utterance and introduces an assessment. Never replace a word
+with a synonym, diagnosis, inferred intent or stronger certainty. Code performs
+an independent pronunciation-proximity check; confidence cannot bypass it.
 Fix casing, punctuation, spacing, explicitly supplied aliases and short ASR
 misrecognitions of domain terms, ordinary words and compounds. Use the ACTIVE
 conversation context to interpret likely recognition errors. The initial

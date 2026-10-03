@@ -9,6 +9,8 @@ from difflib import SequenceMatcher
 from dataclasses import asdict, dataclass, field
 from typing import Callable, Protocol
 
+from .phonetics import changes_stay_close, phonetically_close
+
 
 def words(text: str) -> list[str]:
     return re.findall(r"\w+", text.casefold(), flags=re.UNICODE)
@@ -256,16 +258,16 @@ class Broker:
                          and similarity.ratio() >= .88 and edit_budget <= 2
                          and number_words_unchanged)
             valid_content = numbers_unchanged and negation_unchanged and number_words_unchanged
-            # The model may identify phonetic/contextual ASR errors without a
-            # character-similarity gate. Require an explicit classification and
-            # rationale, and keep the change local rather than rewriting prose.
+            # Model classification is not evidence: every lexical correction
+            # must independently pass the pronunciation-proximity gate below.
             semantic = (self.allow_semantic_repairs and p.kind == "asr_error"
                         and isinstance(p.reason, str) and bool(p.reason.strip())
                         and len(p.source) <= 80
                         and len(p.replacement) <= 80
                         and 1 <= len(words(p.source)) <= 4
                         and 1 <= len(words(p.replacement)) <= 4)
-            if (formatting or alias or near_term or semantic) and boundary and valid_content and p.replacement != p.source:
+            phonetic = phonetically_close(p.source, p.replacement)
+            if (formatting or ((alias or near_term or semantic) and phonetic)) and boundary and valid_content and p.replacement != p.source:
                 accepted.append(p)
             elif self.emit_suggestions and boundary and valid_content and p.replacement != p.source:
                 self.emit({"type": "suggestion", "segment_id": segment_id, "base_revision": revision,
@@ -276,6 +278,8 @@ class Broker:
         text = segment.text
         for p in reversed(accepted):
             text = text[:p.start] + p.replacement + text[p.end:]
+        if not changes_stay_close(segment.raw, text):
+            return False  # Repeated small repairs must not drift from RAW speech.
         segment.text, segment.revision = text, revision + 1
         self.emit({"type": "patch", "segment_id": segment_id, "base_revision": revision,
                    "revision": segment.revision, "patches": [asdict(p) for p in accepted], "text": text})
