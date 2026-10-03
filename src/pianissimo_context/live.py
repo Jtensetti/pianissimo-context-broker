@@ -6,7 +6,7 @@ from collections import deque
 from dataclasses import asdict, dataclass, field
 import math
 
-from .broker import Broker, Segment, contains_phrase
+from .broker import Broker, Segment, contains_phrase, words
 
 
 @dataclass
@@ -25,10 +25,11 @@ class AdaptiveBroker(Broker):
     Recent raw speech lives independently of the shorter mutable text window.
     """
     def __init__(self, *args, initial_context: str = "", review_seconds: float = 25,
-                 history_seconds: float = 30, **kwargs):
+                 history_seconds: float = 30, semantic_repairs: bool = True, **kwargs):
         kwargs.setdefault("allow_context_repairs", True)
         kwargs.setdefault("emit_suggestions", True)
         super().__init__(*args, **kwargs)
+        self.allow_semantic_repairs = semantic_repairs and self.allow_context_repairs
         if not isinstance(initial_context, str) or len(initial_context) > 4000:
             raise ValueError("Initial context must be text of at most 4000 characters")
         if not math.isfinite(review_seconds) or not 20 <= review_seconds <= 30:
@@ -38,9 +39,9 @@ class AdaptiveBroker(Broker):
         self.initial_context = initial_context
         self.review_seconds, self.history_seconds = review_seconds, history_seconds
         self.active = ActiveContext(topic=self.context.topic or initial_context[:200])
-        # Bounded topic memory outlives raw rolling history, but never becomes
+        # Session topic memory outlives raw rolling history, but never becomes
         # a transcript or proof of speaker facts. Initial background stays separate.
-        self.remembered_topics: deque[dict] = deque(maxlen=8)
+        self.remembered_topics: deque[dict] = deque()
         self.history: deque[tuple[float, int, str]] = deque(maxlen=200)
         self._reviewed_at = self.clock()
         self._reviewed_id = -1
@@ -52,19 +53,70 @@ class AdaptiveBroker(Broker):
     def context_version(self) -> int:
         return self.active.revision
 
+    def context_snapshot(self) -> dict:
+        return {"background": self.manual_context if self.manual_context is not None else self.initial_context,
+                "active_context": asdict(self.active),
+                "remembered_topics": list(self.remembered_topics)}
+
+    def _emit_context(self, mode: str):
+        self.emit({"type": "context", "mode": mode, **self.context_snapshot(),
+                   "through_segment_id": self._next_id - 1})
+
+    def _remember_active(self):
+        if not self.active.revision or not self.active.topic.strip():
+            return
+        self.remembered_topics = deque(t for t in self.remembered_topics
+            if t["topic"].casefold() != self.active.topic.casefold())
+        self.remembered_topics.append({"topic": self.active.topic, "summary": self.active.summary,
+            "evidence": self.active.evidence, "context_revision": self.active.revision})
+
+    def set_context_stack(self, background: str, current: str, memory: list) -> None:
+        """Atomically replace an operator-reviewed stack; invalidate in-flight work."""
+        if self._finished:
+            raise ValueError("Ingen aktiv transkription")
+        if not isinstance(background, str) or len(background) > 4000:
+            raise ValueError("Bakgrunden får innehålla högst 4 000 tecken")
+        if not isinstance(current, str) or not current.strip() or len(current) > 1000:
+            raise ValueError("Aktuell kontext måste innehålla 1–1 000 tecken")
+        if not isinstance(memory, list) or len(memory) > 500:
+            raise ValueError("Ogiltigt ämnesminne")
+        entries = []
+        seen = set()
+        for row in memory:
+            if not isinstance(row, (list, tuple)) or len(row) != 2 or not all(isinstance(v, str) for v in row):
+                raise ValueError("Varje ämne behöver en rubrik och en kontext")
+            topic, summary = (v.strip() for v in row)
+            if not topic and not summary:
+                continue
+            if not topic or len(topic) > 200 or len(summary) > 1000 or topic.casefold() in seen:
+                raise ValueError("Ämnesrubriker måste vara unika och högst 200 tecken; kontext högst 1 000")
+            seen.add(topic.casefold())
+            entries.append({"topic": topic, "summary": summary, "evidence": [],
+                            "context_revision": self.active.revision + 1, "source": "manual"})
+        self.manual_context = background.strip()
+        self._manual_revision += 1
+        self.active = ActiveContext(current.splitlines()[0][:200], current.strip(), [], [], self.active.revision + 1)
+        self.remembered_topics = deque(entries)
+        self.dynamic_terms = []
+        self._bootstrapped = True
+        self._reviewed_at = self.clock()
+        self._reviewed_id = self._next_id - 1
+        self._emit_context("manual")
+        self.emit({"type": "glossary", "phrases": self.glossary()})
+
     def set_manual_context(self, text: str) -> None:
         if self._finished:
             raise RuntimeError("Conversation is closed")
         if not isinstance(text, str) or not text.strip() or len(text) > 4000:
             raise ValueError("Manual context must contain 1–4000 characters")
+        self._remember_active()
         self.manual_context = text.strip()
         self._manual_revision += 1
         self.active = ActiveContext(self.manual_context.splitlines()[0][:200], self.manual_context,
                                     [], [], self.active.revision + 1)
         self.dynamic_terms = []
         self._bootstrapped = False
-        self.emit({"type": "context", "mode": "manual", "active_context": asdict(self.active),
-                   "remembered_topics": list(self.remembered_topics), "through_segment_id": self._next_id - 1})
+        self._emit_context("manual")
         self.emit({"type": "glossary", "phrases": self.glossary()})
 
     def add(self, raw: str, **kwargs) -> Segment:
@@ -91,10 +143,17 @@ class AdaptiveBroker(Broker):
                  and self._next_id - 1 > self._reviewed_id)))
 
     def memory_payload(self) -> list[dict]:
-        # Keep the language-model prompt smaller than the diagnostic archive.
-        return [{"topic": t["topic"], "summary": t["summary"][:600],
-                 "evidence": [e[:200] for e in t["evidence"][:1]],
-                 "context_revision": t["context_revision"]} for t in self.remembered_topics]
+        # Retain the full session archive, but send at most eight topics:
+        # four recent threads plus four selected by lexical relevance to speech.
+        archive = list(self.remembered_topics)
+        query = set(words(self.recent_raw() + " " + self.active.topic))
+        ranked = sorted(range(max(0, len(archive) - 4)),
+                        key=lambda i: len(query & set(words(archive[i]["topic"] + " " + archive[i]["summary"]))),
+                        reverse=True)[:4]
+        selected = sorted(set(ranked + list(range(max(0, len(archive) - 4), len(archive)))))
+        return [{"topic": archive[i]["topic"], "summary": archive[i]["summary"][:600],
+                 "evidence": [e[:200] for e in archive[i]["evidence"][:1]],
+                 "context_revision": archive[i]["context_revision"]} for i in selected]
 
     async def review_context(self) -> bool:
         if not self.review_due() or self._busy:
@@ -145,18 +204,12 @@ class AdaptiveBroker(Broker):
             if self.active.topic.casefold() == topic.casefold() and not summary.strip():
                 summary = self.active.summary
             if self.active.revision and self.active.topic.casefold() != topic.casefold():
-                self.remembered_topics = deque(
-                    (t for t in self.remembered_topics if t["topic"].casefold() != self.active.topic.casefold()), maxlen=8)
-                self.remembered_topics.append({"topic": self.active.topic,
-                    "summary": self.active.summary, "evidence": self.active.evidence,
-                    "context_revision": self.active.revision})
+                self._remember_active()
             self.active = ActiveContext(topic, summary, grounded_terms, grounded_evidence,
                                         self.active.revision + 1)
             # Replace rather than append: stale inferred terms expire on review.
             self.dynamic_terms = grounded_terms.copy()
-            self.emit({"type": "context", "mode": payload["mode"],
-                       "active_context": asdict(self.active), "through_segment_id": snapshot_id,
-                       "remembered_topics": list(self.remembered_topics)})
+            self._emit_context(payload["mode"])
             if before != self.glossary():
                 self.emit({"type": "glossary", "phrases": self.glossary()})
             return True
@@ -193,6 +246,7 @@ class LiveSession:
         self._worker_task = None
         self._timer_task = None
         self._processed: dict[int, tuple[int, int]] = {}
+        self._published: dict[int, int] = {}
 
     async def __aenter__(self):
         self._worker_task = asyncio.create_task(self._worker())
@@ -207,12 +261,27 @@ class LiveSession:
         self._wake.set()
         return segment
 
+    def _publish(self, segment, status):
+        if self._published.get(segment.id) == segment.revision:
+            return
+        self._published[segment.id] = segment.revision
+        self.broker.emit({"type": "display", "segment_id": segment.id,
+                          "revision": segment.revision, "text": segment.text,
+                          "review_status": status})
+
     def tick(self):
         self.broker.tick()
-        if self.broker.review_due():
+        for segment in self.broker.segments.values():
+            if segment.committed:
+                self._publish(segment, "expired" if segment.review_status == "pending" else segment.review_status)
+        if self.broker.review_due() or any(
+            not s.committed and self._processed.get(i) != (s.revision, self.broker.active.revision)
+            for i, s in self.broker.segments.items()
+        ):
             self._wake.set()
         self.broker.release_committed()
         self._processed = {i: v for i, v in self._processed.items() if i in self.broker.segments}
+        self._published = {i: v for i, v in self._published.items() if i in self.broker.segments}
 
     async def _timer(self):
         while True:
@@ -230,10 +299,13 @@ class LiveSession:
                     continue
                 state = (s.revision, self.broker.active.revision)
                 if self._processed.get(i) != state:
+                    s.review_status = "pending"
                     await self.broker.repair(i)
                     self._processed[i] = (s.revision, state[1])
                     if self.broker.active.revision != state[1]:
                         self._wake.set()
+                    else:
+                        self._publish(s, "expired" if s.review_status == "pending" else s.review_status)
             # A cadence review may become due during inference.
             if self.broker.review_due():
                 self._wake.set()
@@ -251,4 +323,6 @@ class LiveSession:
         finally:
             self._timer_task.cancel()
             await asyncio.gather(self._timer_task, return_exceptions=True)
+            for segment in self.broker.segments.values():
+                self._publish(segment, "interrupted" if segment.review_status == "pending" else segment.review_status)
             self.broker.finish()

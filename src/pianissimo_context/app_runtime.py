@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import Future
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from threading import Event, Lock, Thread
 from typing import Callable
@@ -22,6 +22,8 @@ class Snapshot:
     revision: int
     updated: str
     message: str
+    background: str = ""
+    memory: list = field(default_factory=list)
 
 
 class AppRuntime:
@@ -44,6 +46,8 @@ class AppRuntime:
         self._message = ""
         self._segments: dict[int, str] = {}
         self._context = ""
+        self._background = ""
+        self._memory = []
         self._revision = 0
         self._updated = ""
         self._thread = Thread(target=self._serve, name="pianissimo-app", daemon=True)
@@ -63,11 +67,14 @@ class AppRuntime:
     def _event(self, event):
         with self._lock:
             kind = event["type"]
-            if kind == "raw":
-                self._segments[event["segment"]["id"]] = event["segment"]["text"]
-            elif kind in {"patch", "commit"}:
+            if kind == "display":
                 self._segments[event["segment_id"]] = event["text"]
+                if event["review_status"] != "reviewed":
+                    self._message = "Text visad utan slutförd språkgranskning"
+
             elif kind == "context":
+                self._background = event.get("background", self._background)
+                self._memory = [[t["topic"], t["summary"]] for t in event["remembered_topics"]]
                 active = event["active_context"]
                 topic, summary = active["topic"], active["summary"]
                 self._context = summary if summary.startswith(topic) else "\n\n".join(t for t in (topic, summary) if t)
@@ -102,6 +109,7 @@ class AppRuntime:
             self._stop_event = asyncio.Event()
             self._segments = {}
             self._context, self._updated = initial_context, ""
+            self._background, self._memory = initial_context, []
             self._revision += 1
             self._broker = None
             self._future = asyncio.run_coroutine_threadsafe(
@@ -152,10 +160,31 @@ class AppRuntime:
             future.cancel()
             raise RuntimeError("Kontexten kunde inte sparas") from None
 
+    def update_stack(self, background: str, current: str, memory: list, expected_revision: int):
+        async def update():
+            with self._lock:
+                if self._closed or not self._running or self._status == "Stoppar":
+                    raise ValueError("Ingen aktiv transkription")
+                if self._revision != expected_revision:
+                    raise ValueError("Kontexten har uppdaterats. Avbryt och öppna redigeringen igen.")
+            if self._broker is None or self._broker._finished:
+                raise ValueError("Ingen aktiv transkription")
+            self._broker.set_context_stack(background, current, memory)
+        with self._lock:
+            if self._closed:
+                raise ValueError("Applikationen är stängd")
+        future = asyncio.run_coroutine_threadsafe(update(), self._loop)
+        try:
+            future.result(timeout=5)
+        except TimeoutError:
+            future.cancel()
+            raise RuntimeError("Kontexten kunde inte sparas") from None
+
     def snapshot(self) -> Snapshot:
         with self._lock:
-            return Snapshot(self._running, self._status, "\n".join(self._segments.values()),
-                            self._context, self._revision, self._updated, self._message)
+            return Snapshot(self._running, self._status, "\n".join(self._segments[i] for i in sorted(self._segments)),
+                            self._context, self._revision, self._updated, self._message,
+                            self._background, [row.copy() for row in self._memory])
 
     def notice(self, message: str):
         with self._lock:
