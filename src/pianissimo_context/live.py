@@ -46,6 +46,26 @@ class AdaptiveBroker(Broker):
         self._reviewed_id = -1
         self._bootstrapped = False
         self._finished = False
+        self.manual_context: str | None = None
+        self._manual_revision = 0
+
+    def context_version(self) -> int:
+        return self.active.revision
+
+    def set_manual_context(self, text: str) -> None:
+        if self._finished:
+            raise RuntimeError("Conversation is closed")
+        if not isinstance(text, str) or not text.strip() or len(text) > 4000:
+            raise ValueError("Manual context must contain 1–4000 characters")
+        self.manual_context = text.strip()
+        self._manual_revision += 1
+        self.active = ActiveContext(self.manual_context.splitlines()[0][:200], self.manual_context,
+                                    [], [], self.active.revision + 1)
+        self.dynamic_terms = []
+        self._bootstrapped = False
+        self.emit({"type": "context", "mode": "manual", "active_context": asdict(self.active),
+                   "remembered_topics": list(self.remembered_topics), "through_segment_id": self._next_id - 1})
+        self.emit({"type": "glossary", "phrases": self.glossary()})
 
     def add(self, raw: str, **kwargs) -> Segment:
         if self._finished:
@@ -82,21 +102,26 @@ class AdaptiveBroker(Broker):
         initial = not self._bootstrapped
         recent = self.recent_raw()
         snapshot_id = self._next_id - 1
+        manual_revision = self._manual_revision
         self._reviewed_at = self.clock()
+        review_started = self._reviewed_at
         self._reviewed_id = -1 if initial else snapshot_id
         self._bootstrapped = True
         reviewer = getattr(self.controller, "review_context", None)
         if reviewer is None or (not initial and not recent.strip()):
             return False
-        payload = {"mode": "initial" if initial else "review",
+        mode = "manual" if initial and self.manual_context is not None else "initial" if initial else "review"
+        payload = {"mode": mode,
                    "initial_context": self.initial_context,
+                   "manual_context": self.manual_context,
                    "explicit_context": asdict(self.context),
                    "active_context": asdict(self.active), "recent_raw": recent,
                    "remembered_topics": self.memory_payload()}
         self._busy = True
         try:
             result = await reviewer(payload)
-            if self._finished or self.clock() - self._reviewed_at >= self.review_seconds:
+            if (self._finished or self._manual_revision != manual_revision
+                or self.clock() - review_started >= self.review_seconds):
                 return False
             if not isinstance(result, dict):
                 raise ValueError("Expected context object")
@@ -107,7 +132,7 @@ class AdaptiveBroker(Broker):
                 or not isinstance(terms, list) or len(terms) > 100
                 or not isinstance(evidence, list) or len(evidence) > 5):
                 raise ValueError("Invalid context response")
-            source = self.initial_context if initial else recent
+            source = (self.manual_context if self.manual_context is not None else self.initial_context) if initial else recent
             grounded_evidence = [e for e in evidence if isinstance(e, str) and 1 <= len(e) <= 300 and e in source]
             # A new topic needs a literal raw evidence quote. During bootstrap,
             # free text was supplied by the user, so no speech proof is needed.
@@ -147,7 +172,7 @@ class AdaptiveBroker(Broker):
         payload = super().repair_payload(segment, revision, original)
         payload.update(initial_context=self.initial_context, active_context=asdict(self.active),
                        previous_text=self.recent_raw(before_id=segment.id)[-4000:],
-                       remembered_topics=self.memory_payload())
+                       remembered_topics=self.memory_payload(), manual_context=self.manual_context)
         return payload
 
     def finish(self):

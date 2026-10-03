@@ -4,10 +4,49 @@ En lokal kontextcontroller för **live-transkribering med Pianissimo**. Ge en
 kort beskrivning av samtalet, låt Pianissimo leverera råtext direkt och låt en
 liten lokal språkmodell föreslå rättningar och följa hur ämnet utvecklas.
 
-Version 0.2 innehåller fri initial kontext, kontextbedömning var 25:e sekund,
+Version 0.3 innehåller fri initial kontext, kontextbedömning var 25:e sekund,
 begränsat samtalsminne, konservativa patchar, JSONL-events och valfri
 mikrofoninmatning. Det är en körbar prototyp; verklig modellkvalitet och
 hårdvarulatens är ännu inte uppmätta.
+
+## Lokal app
+
+Version 0.3 har ett lokalt webbläsargränssnitt:
+
+```bash
+python -m pip install -e '.[app,asr]'
+pianissimo-app
+```
+
+Installera PyTorch för din hårdvara och starta Ollama med en installerad
+instruction-modell. Gränssnittet öppnas på `http://127.0.0.1:7860`. Välj
+**Ljudkälla**, ange **Initial kontext**, välj **Språkmodell** under
+**Inställningar** och tryck **Starta**. Ljudenheterna kommer från datorn där
+appen körs. **Uppdatera** läser om ljudenheter och Ollama-modeller.
+
+**Transkript** och **Kontext** uppdateras automatiskt. **Redigera** öppnar
+kontextfältet; **Spara** skickar den nya texten till brokern, **Avbryt** återgår
+till den senaste modellkontexten. Under redigering ersätter timeruppdateringar
+inte utkastet. Manuella ändringar lagras som korrigerad bakgrund, medan den
+ursprungliga initialtexten bevaras separat. LLM-svar på äldre kontext avvisas,
+både för kontextuppdateringar och transkriptpatchar.
+
+**Stoppa** stänger ljudflödet och lämnar transkriptet kvar. En ny **Starta**
+börjar en ny inspelning. Pågående modellladdning eller ASR i en arbetstråd måste
+avslutas innan en ny inspelning kan starta. Statusen är då **Stoppar**.
+
+Appen binder endast till loopback, har `share=False` och Gradio-analys avstängd.
+En aktiv inspelning per app-process. Mikrofonen fångas via PortAudio på samma
+dator som Python-processen; ingen ljudinmatning från en annan webbläsardator.
+Systemljud kräver en ljudenhet som operativsystemet exponerar som input.
+Mikrofon-/modellkvalitet är fortfarande inte hårdvarutestad i utvecklingsmiljön.
+UI-komponenter, händelsehanterare och manuell kontextändring testas med dubblar.
+
+För befintliga installationer utan den nya startkommandolänken fungerar också:
+
+```bash
+python -m pianissimo_context.app
+```
 
 ## Så följer brokern samtalet
 

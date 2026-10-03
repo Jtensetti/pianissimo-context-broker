@@ -18,7 +18,12 @@ async def transcribe_microphone(broker: AdaptiveBroker, *, model_name: str,
                                chunk_seconds: int = 4, device: str | int | None = None):
     import sounddevice as sd
     # Initial model download/load happens before microphone capture is started.
-    asr = await asyncio.to_thread(NemoASR.load, model_name)
+    load_task = asyncio.create_task(asyncio.to_thread(NemoASR.load, model_name))
+    try:
+        asr = await asyncio.shield(load_task)
+    except asyncio.CancelledError:
+        await load_task
+        raise
     loop = asyncio.get_running_loop()
     audio_queue = asyncio.Queue(maxsize=3)
     block_size = 1600
@@ -50,11 +55,11 @@ async def transcribe_microphone(broker: AdaptiveBroker, *, model_name: str,
             end = (captured_frames - len(buffer) // 2) / 16000
             loop.call_soon_threadsafe(enqueue, data, end - chunk_seconds, end, False)
 
-    broker.emit({"type": "audio_ready", "sample_rate": 16000, "chunk_seconds": chunk_seconds})
     try:
         async with LiveSession(broker) as session:
             with sd.RawInputStream(samplerate=16000, channels=1, dtype="int16", device=device,
                                    blocksize=block_size, callback=callback):
+                broker.emit({"type": "audio_ready", "sample_rate": 16000, "chunk_seconds": chunk_seconds})
                 with tempfile.TemporaryDirectory() as directory:
                     while True:
                         data, start, end = await audio_queue.get()

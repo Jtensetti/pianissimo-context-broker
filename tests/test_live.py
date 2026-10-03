@@ -211,3 +211,43 @@ class AdaptiveTests(unittest.IsolatedAsyncioTestCase):
         self.controller.review_context = too_slow
         self.assertFalse(await b.review_context())
         self.assertEqual(b.active.revision, 0)
+
+    async def test_manual_context_wins_over_inflight_context_response(self):
+        b = self.make_broker()
+        entered, release = asyncio.Event(), asyncio.Event()
+        original = self.controller.review_context
+        async def blocked(payload):
+            entered.set()
+            await release.wait()
+            return await original(payload)
+        self.controller.review_context = blocked
+        task = asyncio.create_task(b.review_context())
+        await entered.wait()
+        b.set_manual_context("Rättad bakgrund om Kompostering")
+        release.set()
+        self.assertFalse(await task)
+        self.assertEqual(b.manual_context, "Rättad bakgrund om Kompostering")
+        self.assertEqual(b.active.summary, b.manual_context)
+        self.assertTrue(b.review_due())
+        self.controller.review_context = original
+        self.controller.response = {"topic": "Kompostering", "terms": ["Kompostering", "Svea"], "evidence": []}
+        await b.review_context()
+        self.assertEqual(self.controller.reviews[-1]["mode"], "manual")
+        self.assertEqual(b.glossary(), ["Kompostering"])
+        self.assertEqual(b.initial_context, INITIAL)
+
+    async def test_manual_context_invalidates_inflight_transcript_patch(self):
+        b = self.make_broker()
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def blocked(payload):
+            entered.set()
+            await release.wait()
+            return {"patches": [{"start": 0, "end": 3, "source": "hej", "replacement": "Hej", "confidence": .99}]}
+        self.controller.propose = blocked
+        s = b.add("hej")
+        task = asyncio.create_task(b.repair(s.id))
+        await entered.wait()
+        b.set_manual_context("Annan bakgrund")
+        release.set()
+        self.assertFalse(await task)
+        self.assertEqual(s.text, "hej")

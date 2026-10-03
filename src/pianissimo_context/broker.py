@@ -99,6 +99,9 @@ class Broker:
                 "previous_text": " ".join(s.raw for s in list(self.segments.values())[-8:]
                                            if s.id < segment.id)[-4000:]}
 
+    def context_version(self) -> int:
+        return 0
+
     def glossary(self) -> list[str]:
         return list(dict.fromkeys(self.context.glossary() + self.dynamic_terms))[:100]
 
@@ -151,11 +154,13 @@ class Broker:
         if self.controller is None:
             return bool(patches)
         payload = self.repair_payload(segment, revision, original)
+        context_version = self.context_version()
         self._busy = True
         try:
             result = await self.controller.propose(payload)
             self.tick()
-            if segment.committed or segment.revision != revision or segment.id not in self.segments:
+            if (segment.committed or segment.revision != revision or segment.id not in self.segments
+                or self.context_version() != context_version):
                 return False
             if not isinstance(result, dict):
                 raise ValueError("Expected an object")
