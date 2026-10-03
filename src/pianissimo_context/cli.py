@@ -10,6 +10,7 @@ import wave
 
 from .broker import Broker, Context
 from .llm import Ollama
+from .live import AdaptiveBroker, LiveSession
 
 
 def output(event):
@@ -19,7 +20,12 @@ def output(event):
 async def run(args):
     context = Context(**json.loads(Path(args.context).read_text(encoding="utf-8"))) if args.context else Context()
     controller = Ollama(args.ollama_model) if args.ollama_model else None
-    broker = Broker(context, controller, output, args.mutable_seconds)
+    if args.command in {"text", "live", "microphone"}:
+        broker = AdaptiveBroker(context, controller, output, args.mutable_seconds,
+                                initial_context=args.initial_context, review_seconds=args.review_seconds,
+                                allow_context_repairs=not args.suggestions_only)
+    else:
+        broker = Broker(context, controller, output, args.mutable_seconds)
     if args.command == "demo":
         broker.context = Context(topic="Kommunal AI-utveckling", organisations=("AI Sweden",),
                                  terms=("Svea", "pseudonymisering"), aliases={"aj sveden": "AI Sweden", "svea": "Svea"})
@@ -28,38 +34,14 @@ async def run(args):
             segment = broker.add(text)
             await broker.repair(segment.id)
         broker.finish()
-    elif args.command == "text":
-        # Read stdin off-loop while a timer enforces locking during silence.
-        async def timer():
-            while True:
-                await asyncio.sleep(.1)
-                broker.tick()
-        timer_task = asyncio.create_task(timer())
-        notifications = asyncio.Queue(maxsize=1)
-        async def worker():
-            last_id = -1
-            while True:
-                await notifications.get()
-                try:
-                    for segment_id in list(broker.segments):
-                        if segment_id > last_id:
-                            last_id = segment_id
-                            await broker.repair(segment_id)
-                finally:
-                    notifications.task_done()
-        worker_task = asyncio.create_task(worker())
-        try:
+    elif args.command in {"text", "live"}:
+        async with LiveSession(broker) as session:
             while line := await asyncio.to_thread(sys.stdin.readline):
-                segment = broker.add(line.rstrip("\r\n"))
-                if notifications.empty():
-                    notifications.put_nowait(None)
-                broker.release_committed()
-            await notifications.join()
-            broker.finish()
-        finally:
-            timer_task.cancel()
-            worker_task.cancel()
-            await asyncio.gather(timer_task, worker_task, return_exceptions=True)
+                session.push(line.rstrip("\r\n"))
+    elif args.command == "microphone":
+        from .microphone import transcribe_microphone
+        await transcribe_microphone(broker, model_name=args.asr_model,
+                                   chunk_seconds=args.chunk_seconds, device=args.device)
     else:
         from .asr import NemoASR
         asr = NemoASR.load(args.asr_model)
@@ -90,9 +72,16 @@ def main():
     parser.add_argument("--context", help="User-supplied context JSON")
     parser.add_argument("--ollama-model", help="Installed local Ollama model name; omitted = aliases only")
     parser.add_argument("--mutable-seconds", type=float, default=15)
+    parser.add_argument("--initial-context", default="", help="Free-text background for the live conversation")
+    parser.add_argument("--review-seconds", type=float, default=25, help="Live topic review cadence, 20–30 seconds")
+    parser.add_argument("--suggestions-only", action="store_true", help="Disable automatic context term substitutions")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("demo")
-    commands.add_parser("text", help="Read transcript segments from stdin, emit JSONL events")
+    commands.add_parser("text", aliases=["live"], help="Live raw ASR segments from stdin; adaptive context; JSONL output")
+    microphone = commands.add_parser("microphone", help="Chunked live capture with Pianissimo and adaptive context")
+    microphone.add_argument("--asr-model", default="KlangAI/pianissimo-sv")
+    microphone.add_argument("--chunk-seconds", type=int, choices=range(2, 11), default=4)
+    microphone.add_argument("--device", help="PortAudio input device name")
     audio = commands.add_parser("audio", help="Experimental independent WAV chunk decoding")
     audio.add_argument("file")
     audio.add_argument("--asr-model", default="KlangAI/pianissimo-sv")

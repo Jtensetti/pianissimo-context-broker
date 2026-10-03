@@ -4,13 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pianissimo-context-broker"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local, conservative context controller for Swedish speech recognition"
 requires-python = ">=3.11"
 dependencies = []
 
 [project.optional-dependencies]
 asr = ["nemo_toolkit[asr]>=2.4,<3"]
+live = ["sounddevice>=0.4,<1"]
 
 [project.scripts]
 pianissimo-context = "pianissimo_context.cli:main"

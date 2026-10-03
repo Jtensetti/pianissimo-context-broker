@@ -5,6 +5,7 @@ import asyncio
 import math
 import re
 import time
+from difflib import SequenceMatcher
 from dataclasses import asdict, dataclass, field
 from typing import Callable, Protocol
 
@@ -76,7 +77,8 @@ class Broker:
     """
     def __init__(self, context: Context | None = None, controller: Controller | None = None,
                  emit: Callable[[dict], None] | None = None, mutable_seconds: float = 15,
-                 confidence_threshold: float = .95, clock: Callable[[], float] = time.monotonic):
+                 confidence_threshold: float = .95, clock: Callable[[], float] = time.monotonic,
+                 allow_context_repairs: bool = False, emit_suggestions: bool = False):
         if not math.isfinite(mutable_seconds) or mutable_seconds <= 0:
             raise ValueError("mutable_seconds must be positive")
         if not 0 <= confidence_threshold <= 1:
@@ -88,6 +90,14 @@ class Broker:
         self.dynamic_terms: list[str] = []
         self._next_id = 0
         self._busy = False
+        self.allow_context_repairs = allow_context_repairs
+        self.emit_suggestions = emit_suggestions
+
+    def repair_payload(self, segment: Segment, revision: int, original: str) -> dict:
+        return {"context": asdict(self.context), "glossary": self.glossary(),
+                "segment": {"id": segment.id, "revision": revision, "text": original},
+                "previous_text": " ".join(s.raw for s in list(self.segments.values())[-8:]
+                                           if s.id < segment.id)[-4000:]}
 
     def glossary(self) -> list[str]:
         return list(dict.fromkeys(self.context.glossary() + self.dynamic_terms))[:100]
@@ -129,8 +139,8 @@ class Broker:
         if segment is None or segment.committed or self._busy:
             return False
         revision, original = segment.revision, segment.text
-        # Explicit aliases work offline and are the only semantic replacements
-        # that can be automatically applied. Model confidence is not ASR evidence.
+        # Explicit aliases work offline. Live mode additionally permits tightly
+        # bounded active-term substitutions; model confidence is not ASR evidence.
         patches = []
         for alias, canonical in self.context.aliases.items():
             for match in re.finditer(r"(?<!\w)" + re.escape(alias) + r"(?!\w)", original, re.I):
@@ -140,10 +150,7 @@ class Broker:
             revision, original = segment.revision, segment.text
         if self.controller is None:
             return bool(patches)
-        payload = {"context": asdict(self.context), "glossary": self.glossary(),
-                   "segment": {"id": segment.id, "revision": revision, "text": original},
-                   "previous_text": " ".join(s.raw for s in list(self.segments.values())[-8:]
-                                              if s.id < segment.id)[-4000:]}
+        payload = self.repair_payload(segment, revision, original)
         self._busy = True
         try:
             result = await self.controller.propose(payload)
@@ -206,8 +213,26 @@ class Broker:
             # Removing spaces must not silently change 'inte' to another word.
             protected = {"inte", "ej", "icke", "aldrig", "ingen", "inget", "inga", "utan"}
             negation_unchanged = [w for w in words(p.source) if w in protected] == [w for w in words(p.replacement) if w in protected]
-            if (formatting or alias) and boundary and numbers_unchanged and negation_unchanged and p.replacement != p.source:
+            # Live context repairs must remain orthographically close to an
+            # active term. This is a heuristic, not acoustic verification.
+            source_key = "".join(words(p.source))
+            replacement_key = "".join(words(p.replacement))
+            number_words = {"noll", "ett", "en", "två", "tre", "fyra", "fem", "sex", "sju", "åtta", "nio", "tio",
+                            "elva", "tolv", "hundra", "tusen", "miljon", "miljoner", "miljard", "miljarder"}
+            number_words_unchanged = [w for w in words(p.source) if w in number_words] == [w for w in words(p.replacement) if w in number_words]
+            similarity = SequenceMatcher(None, source_key, replacement_key, autojunk=False)
+            edit_budget = sum(max(a2 - a1, b2 - b1) for tag, a1, a2, b1, b2 in similarity.get_opcodes() if tag != "equal")
+            near_term = (self.allow_context_repairs and p.replacement in self.glossary()
+                         and 6 <= len(source_key) <= 60 and len(words(p.source)) <= 4
+                         and len(words(p.replacement)) <= 4
+                         and similarity.ratio() >= .88 and edit_budget <= 2
+                         and number_words_unchanged)
+            valid_content = numbers_unchanged and negation_unchanged
+            if (formatting or alias or near_term) and boundary and valid_content and p.replacement != p.source:
                 accepted.append(p)
+            elif self.emit_suggestions and boundary and valid_content and p.replacement != p.source:
+                self.emit({"type": "suggestion", "segment_id": segment_id, "base_revision": revision,
+                           "patch": asdict(p), "status": "unverified", "text_changed": False})
         accepted.sort(key=lambda p: (p.start, p.end))
         if not accepted or any(a.end > b.start for a, b in zip(accepted, accepted[1:])):
             return False  # Reject ambiguous overlapping batches atomically.
