@@ -128,7 +128,7 @@ fraser i en JSON-kontext ligger kvar tills appen ändrar dem.
 Python 3.11 eller senare. Kärnan har inga externa körberoenden.
 
 ```bash
-git clone -b feat/local-context-broker https://github.com/Jtensetti/pianissimo-context-broker.git
+git clone -b main https://github.com/Jtensetti/pianissimo-context-broker.git
 cd pianissimo-context-broker
 python -m venv .venv
 # Linux/macOS:
